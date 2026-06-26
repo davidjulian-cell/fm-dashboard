@@ -7,21 +7,24 @@ import {
   YAxis,
   Tooltip,
   ResponsiveContainer,
-  CartesianGrid,
-  PieChart,
-  Pie,
-  Cell
+  CartesianGrid
 } from "recharts";
-import {
-  Briefcase,
-  Building2,
-  Euro,
-  Users,
-  AlertTriangle,
-  Activity
-} from "lucide-react";
 
 const FILE_URL = "/fm-data.xlsx";
+
+const COUNTRY_COST_FACTOR = {
+  France: 1.0,
+  Spain: 0.9,
+  Italy: 0.95,
+  Germany: 1.15,
+  Austria: 1.12,
+  Switzerland: 1.45,
+  Netherlands: 1.18,
+  Belgium: 1.12,
+  UK: 1.2,
+  Portugal: 0.82,
+  Poland: 0.72
+};
 
 function toNumber(value) {
   if (value === null || value === undefined || value === "") return 0;
@@ -33,48 +36,189 @@ function formatEuro(value) {
     style: "currency",
     currency: "EUR",
     maximumFractionDigits: 0
-  }).format(value);
+  }).format(value || 0);
 }
 
-function topBy(rows, groupCol, valueCol, limit = 10) {
+function percentileRank(values, value) {
+  if (!values.length) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const below = sorted.filter((v) => v <= value).length;
+  return below / sorted.length;
+}
+
+function groupBy(rows, keyFn) {
+  const map = {};
+  rows.forEach((row) => {
+    const key = keyFn(row) || "No informado";
+    if (!map[key]) map[key] = [];
+    map[key].push(row);
+  });
+  return map;
+}
+
+function buildStoreMaster(workbook) {
+  const possibleSheet = workbook.SheetNames.find((name) =>
+    ["STORE_MASTER", "LOCATION_MASTER", "MASTER", "STORES"].includes(
+      name.toUpperCase()
+    )
+  );
+
+  if (!possibleSheet) return {};
+
+  const ws = workbook.Sheets[possibleSheet];
+  const rows = XLSX.utils.sheet_to_json(ws, { defval: "" });
+
   const map = {};
 
   rows.forEach((row) => {
-    const key = row[groupCol] || "No informado";
-    const value = toNumber(row[valueCol]);
-    map[key] = (map[key] || 0) + value;
+    const location = String(row["Location Number"] || "").trim();
+    const country = String(row["Country"] || "").trim();
+
+    if (location && country) {
+      map[location] = country;
+    }
   });
 
-  return Object.entries(map)
-    .map(([name, value]) => ({ name, value }))
-    .sort((a, b) => b.value - a.value)
-    .slice(0, limit);
+  return map;
 }
 
-function countBy(rows, groupCol) {
-  const map = {};
+function enrichRowsWithCountry(rows, storeMaster) {
+  return rows.map((row) => {
+    const location = String(row["Location Number"] || "").trim();
 
-  rows.forEach((row) => {
-    const key = row[groupCol] || "No informado";
-    map[key] = (map[key] || 0) + 1;
+    return {
+      ...row,
+      Country:
+        row["Country"] ||
+        storeMaster[location] ||
+        "Unknown"
+    };
+  });
+}
+
+function buildCountryBenchmark(rows) {
+  const byCountry = groupBy(rows, (row) => row.Country);
+  const result = Object.entries(byCountry).map(([country, countryRows]) => {
+    const wo = countryRows.length;
+    const spend = countryRows.reduce(
+      (sum, row) => sum + toNumber(row["Inv. Amount"]),
+      0
+    );
+    const avgCost = wo ? spend / wo : 0;
+
+    return {
+      country,
+      wo,
+      spend,
+      avgCost
+    };
   });
 
-  return Object.entries(map)
-    .map(([name, value]) => ({ name, value }))
-    .sort((a, b) => b.value - a.value);
+  const france = result.find((r) => r.country === "France");
+  const franceAvg = france?.avgCost || result[0]?.avgCost || 1;
+
+  return result
+    .map((row) => {
+      const factor = COUNTRY_COST_FACTOR[row.country] || 1;
+      const expectedAvg = franceAvg * factor;
+      const franceIndex = franceAvg ? (row.avgCost / franceAvg) * 100 : 0;
+      const cpi = expectedAvg ? row.avgCost / expectedAvg : 0;
+
+      return {
+        ...row,
+        factor,
+        expectedAvg,
+        franceIndex,
+        cpi
+      };
+    })
+    .sort((a, b) => b.franceIndex - a.franceIndex);
 }
 
-function KpiCard({ title, value, subtitle, icon: Icon }) {
+function buildStoreRanking(rows) {
+  const byStore = groupBy(rows, (row) => String(row["Location Number"] || ""));
+
+  const stores = Object.entries(byStore).map(([location, storeRows]) => {
+    const wo = storeRows.length;
+    const spend = storeRows.reduce(
+      (sum, row) => sum + toNumber(row["Inv. Amount"]),
+      0
+    );
+    const avgInvoice = wo ? spend / wo : 0;
+
+    const emergency = storeRows.filter((row) =>
+      String(row["Priority"] || "").toUpperCase().includes("RED")
+    ).length;
+
+    const corrective = storeRows.filter((row) =>
+      String(row["Category"] || "").toUpperCase().includes("CORRECTIVE")
+    ).length;
+
+    const overNTE = storeRows.filter((row) => {
+      const nte = toNumber(row["NTE"]);
+      const inv = toNumber(row["Inv. Amount"]);
+      return nte > 0 && inv > nte;
+    }).length;
+
+    const providers = new Set(
+      storeRows.map((row) => row["Provider Name"]).filter(Boolean)
+    ).size;
+
+    const country = storeRows[0]?.Country || "Unknown";
+
+    return {
+      location,
+      country,
+      wo,
+      spend,
+      avgInvoice,
+      emergency,
+      corrective,
+      overNTE,
+      providers,
+      emergencyRate: wo ? emergency / wo : 0,
+      correctiveRate: wo ? corrective / wo : 0,
+      overNTERate: wo ? overNTE / wo : 0
+    };
+  });
+
+  const spendValues = stores.map((s) => s.spend);
+  const woValues = stores.map((s) => s.wo);
+  const avgValues = stores.map((s) => s.avgInvoice);
+  const emergencyValues = stores.map((s) => s.emergencyRate);
+  const overNTEValues = stores.map((s) => s.overNTERate);
+  const providerValues = stores.map((s) => s.providers);
+
+  return stores
+    .map((store) => {
+      const financialRisk =
+        percentileRank(spendValues, store.spend) * 0.28 +
+        percentileRank(avgValues, store.avgInvoice) * 0.22;
+
+      const operationalRisk =
+        percentileRank(woValues, store.wo) * 0.2 +
+        percentileRank(emergencyValues, store.emergencyRate) * 0.12 +
+        percentileRank(overNTEValues, store.overNTERate) * 0.12 +
+        percentileRank(providerValues, store.providers) * 0.06;
+
+      const riskScore = Math.round((financialRisk + operationalRisk) * 100);
+      const healthScore = Math.max(0, 100 - riskScore);
+
+      return {
+        ...store,
+        riskScore,
+        healthScore
+      };
+    })
+    .sort((a, b) => b.riskScore - a.riskScore);
+}
+
+function KpiCard({ title, value, subtitle }) {
   return (
     <div className="kpi-card">
-      <div>
-        <p className="kpi-title">{title}</p>
-        <h2>{value}</h2>
-        <p className="kpi-subtitle">{subtitle}</p>
-      </div>
-      <div className="kpi-icon">
-        <Icon size={22} />
-      </div>
+      <p className="kpi-title">{title}</p>
+      <h2>{value}</h2>
+      <p className="kpi-subtitle">{subtitle}</p>
     </div>
   );
 }
@@ -89,12 +233,16 @@ export default function App() {
         const response = await fetch(FILE_URL);
         const data = await response.arrayBuffer();
         const workbook = XLSX.read(data, { type: "array", cellDates: true });
-        const firstSheet = workbook.SheetNames[0];
-        const worksheet = workbook.Sheets[firstSheet];
-        const json = XLSX.utils.sheet_to_json(worksheet, { defval: "" });
 
-        setRows(json);
-        setStatus(`Excel cargado correctamente: ${json.length} registros`);
+        const mainSheet = workbook.SheetNames[0];
+        const worksheet = workbook.Sheets[mainSheet];
+
+        const rawRows = XLSX.utils.sheet_to_json(worksheet, { defval: "" });
+        const storeMaster = buildStoreMaster(workbook);
+        const enrichedRows = enrichRowsWithCountry(rawRows, storeMaster);
+
+        setRows(enrichedRows);
+        setStatus(`Excel cargado correctamente: ${enrichedRows.length} registros`);
       } catch (error) {
         console.error(error);
         setStatus("Error cargando el Excel");
@@ -106,65 +254,43 @@ export default function App() {
 
   const metrics = useMemo(() => {
     const totalWO = rows.length;
-    const totalSpend = rows.reduce((sum, row) => sum + toNumber(row["Inv. Amount"]), 0);
-    const totalNTE = rows.reduce((sum, row) => sum + toNumber(row["NTE"]), 0);
+    const totalSpend = rows.reduce(
+      (sum, row) => sum + toNumber(row["Inv. Amount"]),
+      0
+    );
 
-    const providers = new Set(rows.map((r) => r["Provider Name"]).filter(Boolean)).size;
-    const locations = new Set(rows.map((r) => r["Location Number"]).filter(Boolean)).size;
+    const providers = new Set(
+      rows.map((r) => r["Provider Name"]).filter(Boolean)
+    ).size;
+
+    const locations = new Set(
+      rows.map((r) => r["Location Number"]).filter(Boolean)
+    ).size;
+
+    const countries = new Set(
+      rows.map((r) => r["Country"]).filter((c) => c && c !== "Unknown")
+    ).size;
 
     const avgInvoice = totalWO ? totalSpend / totalWO : 0;
-
-    const completed = rows.filter((r) => r["WO Status"] === "COMPLETED").length;
-    const preventive = rows.filter((r) => r["Category"] === "PREVENTIVE").length;
-    const corrective = rows.filter((r) => r["Category"] === "CORRECTIVE").length;
-
-    const overNTE = rows.filter((r) => {
-      const inv = toNumber(r["Inv. Amount"]);
-      const nte = toNumber(r["NTE"]);
-      return nte > 0 && inv > nte;
-    }).length;
 
     return {
       totalWO,
       totalSpend,
-      totalNTE,
       providers,
       locations,
-      avgInvoice,
-      completed,
-      preventive,
-      corrective,
-      overNTE
+      countries,
+      avgInvoice
     };
   }, [rows]);
 
-  const spendByTrade = useMemo(
-    () => topBy(rows, "Trade", "Inv. Amount", 10),
+  const countryBenchmark = useMemo(
+    () => buildCountryBenchmark(rows).filter((r) => r.country !== "Unknown"),
     [rows]
   );
 
-  const spendByProvider = useMemo(
-    () => topBy(rows, "Provider Name", "Inv. Amount", 10),
-    [rows]
-  );
+  const storeRanking = useMemo(() => buildStoreRanking(rows), [rows]);
 
-  const priorityMix = useMemo(
-    () => countBy(rows, "Priority").slice(0, 6),
-    [rows]
-  );
-
-  const statusMix = useMemo(
-    () => countBy(rows, "WO Status").slice(0, 8),
-    [rows]
-  );
-
-  const topWO = useMemo(() => {
-    return [...rows]
-      .sort((a, b) => toNumber(b["Inv. Amount"]) - toNumber(a["Inv. Amount"]))
-      .slice(0, 10);
-  }, [rows]);
-
-  const pieColors = ["#EB8C00", "#DB536A", "#464646", "#FFB600", "#7D7D7D", "#E0301E"];
+  const topRiskStores = storeRanking.slice(0, 15);
 
   return (
     <main className="page">
@@ -173,8 +299,7 @@ export default function App() {
           <p className="eyebrow">PwC style · FM Analytics</p>
           <h1>Executive Facility Management Dashboard</h1>
           <p className="hero-text">
-            Financial and operational analysis of work orders, invoices, providers,
-            trades, priorities and risk signals.
+            Cost benchmarking, store ranking and financial risk analysis based on work order data.
           </p>
         </div>
 
@@ -188,166 +313,167 @@ export default function App() {
           title="Total Spend"
           value={formatEuro(metrics.totalSpend)}
           subtitle="Total invoice amount"
-          icon={Euro}
         />
         <KpiCard
           title="Work Orders"
           value={metrics.totalWO.toLocaleString("es-ES")}
           subtitle="Total records loaded"
-          icon={Briefcase}
         />
         <KpiCard
           title="Avg. Invoice / WO"
           value={formatEuro(metrics.avgInvoice)}
           subtitle="Average cost per work order"
-          icon={Activity}
         />
         <KpiCard
           title="Providers"
           value={metrics.providers}
           subtitle="Unique providers"
-          icon={Users}
         />
         <KpiCard
           title="Locations"
           value={metrics.locations}
-          subtitle="Unique locations"
-          icon={Building2}
+          subtitle="Unique stores"
         />
         <KpiCard
-          title="Over NTE"
-          value={metrics.overNTE}
-          subtitle="Invoices above NTE"
-          icon={AlertTriangle}
+          title="Countries"
+          value={metrics.countries}
+          subtitle="Countries detected"
         />
       </section>
 
-      <section className="insight-panel">
-        <p className="eyebrow">Executive reading</p>
-        <h3>Key signals from the current file</h3>
-        <ul>
-          <li>
-            The file contains <strong>{metrics.totalWO.toLocaleString("es-ES")}</strong> work orders
-            across <strong>{metrics.locations}</strong> locations.
-          </li>
-          <li>
-            Total invoice amount is <strong>{formatEuro(metrics.totalSpend)}</strong>, with an
-            average cost of <strong>{formatEuro(metrics.avgInvoice)}</strong> per work order.
-          </li>
-          <li>
-            The dashboard has detected <strong>{metrics.overNTE}</strong> cases where invoice
-            amount is above NTE.
-          </li>
-        </ul>
-      </section>
+      {countryBenchmark.length === 0 && (
+        <section className="warning-panel">
+          <p className="eyebrow">Country benchmark unavailable</p>
+          <h3>Falta información de país</h3>
+          <p>
+            El fichero actual no contiene una columna <strong>Country</strong>.
+            Para activar el benchmark mundial, añade una segunda pestaña llamada{" "}
+            <strong>STORE_MASTER</strong> con estas columnas:
+          </p>
+          <pre>Location Number | Country</pre>
+        </section>
+      )}
 
-      <section className="two-columns">
-        <div className="panel">
-          <p className="eyebrow">Cost concentration</p>
-          <h3>Spend by Trade</h3>
+      {countryBenchmark.length > 0 && (
+        <section className="panel">
+          <p className="eyebrow">Country benchmark</p>
+          <h3>Average cost by country indexed to France = 100</h3>
           <div className="chart">
             <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={spendByTrade} layout="vertical">
+              <BarChart data={countryBenchmark.slice(0, 15)} layout="vertical">
                 <CartesianGrid stroke="rgba(0,0,0,0.08)" horizontal={false} />
-                <XAxis type="number" tickFormatter={(v) => `€${Math.round(v / 1000)}k`} />
-                <YAxis dataKey="name" type="category" width={160} />
-                <Tooltip formatter={(value) => formatEuro(value)} />
-                <Bar dataKey="value" fill="#EB8C00" radius={[0, 8, 8, 0]} />
+                <XAxis type="number" />
+                <YAxis dataKey="country" type="category" width={150} />
+                <Tooltip
+                  formatter={(value, name) => {
+                    if (name === "franceIndex") return [`${Math.round(value)}`, "Index"];
+                    return value;
+                  }}
+                />
+                <Bar
+                  dataKey="franceIndex"
+                  fill="#EB8C00"
+                  radius={[0, 8, 8, 0]}
+                />
               </BarChart>
             </ResponsiveContainer>
           </div>
-        </div>
+        </section>
+      )}
 
-        <div className="panel">
-          <p className="eyebrow">Supplier concentration</p>
-          <h3>Spend by Provider</h3>
-          <div className="chart">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={spendByProvider} layout="vertical">
-                <CartesianGrid stroke="rgba(0,0,0,0.08)" horizontal={false} />
-                <XAxis type="number" tickFormatter={(v) => `€${Math.round(v / 1000)}k`} />
-                <YAxis dataKey="name" type="category" width={170} />
-                <Tooltip formatter={(value) => formatEuro(value)} />
-                <Bar dataKey="value" fill="#E0301E" radius={[0, 8, 8, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
-          </div>
-        </div>
-      </section>
+      {countryBenchmark.length > 0 && (
+        <section className="panel">
+          <p className="eyebrow">Cost Performance Index</p>
+          <h3>Real cost vs expected country cost</h3>
 
-      <section className="two-columns">
-        <div className="panel">
-          <p className="eyebrow">Operational urgency</p>
-          <h3>Priority Mix</h3>
-          <div className="chart">
-            <ResponsiveContainer width="100%" height="100%">
-              <PieChart>
-                <Pie
-                  data={priorityMix}
-                  dataKey="value"
-                  nameKey="name"
-                  innerRadius={70}
-                  outerRadius={120}
-                  paddingAngle={4}
-                >
-                  {priorityMix.map((entry, index) => (
-                    <Cell key={entry.name} fill={pieColors[index % pieColors.length]} />
-                  ))}
-                </Pie>
-                <Tooltip />
-              </PieChart>
-            </ResponsiveContainer>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Country</th>
+                  <th>WO</th>
+                  <th>Total Spend</th>
+                  <th>Avg. Cost</th>
+                  <th>France Index</th>
+                  <th>Country Factor</th>
+                  <th>Expected Avg.</th>
+                  <th>CPI</th>
+                </tr>
+              </thead>
+              <tbody>
+                {countryBenchmark.map((row) => (
+                  <tr key={row.country}>
+                    <td>{row.country}</td>
+                    <td>{row.wo}</td>
+                    <td>{formatEuro(row.spend)}</td>
+                    <td>{formatEuro(row.avgCost)}</td>
+                    <td>{Math.round(row.franceIndex)}</td>
+                    <td>{row.factor}</td>
+                    <td>{formatEuro(row.expectedAvg)}</td>
+                    <td className={row.cpi > 1.15 ? "bad" : row.cpi < 0.9 ? "good" : ""}>
+                      {row.cpi.toFixed(2)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
-        </div>
+        </section>
+      )}
 
-        <div className="panel">
-          <p className="eyebrow">Execution status</p>
-          <h3>WO Status Mix</h3>
-          <div className="chart">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={statusMix}>
-                <CartesianGrid stroke="rgba(0,0,0,0.08)" vertical={false} />
-                <XAxis dataKey="name" />
-                <YAxis />
-                <Tooltip />
-                <Bar dataKey="value" fill="#464646" radius={[8, 8, 0, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
-          </div>
+      <section className="panel">
+        <p className="eyebrow">Store ranking</p>
+        <h3>Top stores by risk score</h3>
+        <div className="chart">
+          <ResponsiveContainer width="100%" height="100%">
+            <BarChart data={topRiskStores} layout="vertical">
+              <CartesianGrid stroke="rgba(0,0,0,0.08)" horizontal={false} />
+              <XAxis type="number" />
+              <YAxis dataKey="location" type="category" width={120} />
+              <Tooltip />
+              <Bar dataKey="riskScore" fill="#E0301E" radius={[0, 8, 8, 0]} />
+            </BarChart>
+          </ResponsiveContainer>
         </div>
       </section>
 
       <section className="panel">
-        <p className="eyebrow">Risk review</p>
-        <h3>Top 10 Most Expensive Work Orders</h3>
+        <p className="eyebrow">Store intelligence</p>
+        <h3>Numerical ranking by store</h3>
 
         <div className="table-wrap">
           <table>
             <thead>
               <tr>
-                <th>WO</th>
-                <th>Date</th>
+                <th>Rank</th>
                 <th>Location</th>
-                <th>Trade</th>
-                <th>Category</th>
-                <th>Priority</th>
-                <th>Provider</th>
-                <th>NTE</th>
-                <th>Invoice</th>
+                <th>Country</th>
+                <th>Risk Score</th>
+                <th>Health Score</th>
+                <th>WO</th>
+                <th>Total Spend</th>
+                <th>Avg. Invoice</th>
+                <th>Emergency</th>
+                <th>Over NTE</th>
+                <th>Providers</th>
               </tr>
             </thead>
             <tbody>
-              {topWO.map((row, index) => (
-                <tr key={index}>
-                  <td>{row["WO Tracking Number"]}</td>
-                  <td>{String(row["Call Date"]).slice(0, 10)}</td>
-                  <td>{row["Location Number"]}</td>
-                  <td>{row["Trade"]}</td>
-                  <td>{row["Category"]}</td>
-                  <td>{row["Priority"]}</td>
-                  <td>{row["Provider Name"]}</td>
-                  <td>{formatEuro(toNumber(row["NTE"]))}</td>
-                  <td className="strong">{formatEuro(toNumber(row["Inv. Amount"]))}</td>
+              {storeRanking.slice(0, 50).map((store, index) => (
+                <tr key={store.location}>
+                  <td>{index + 1}</td>
+                  <td>{store.location}</td>
+                  <td>{store.country}</td>
+                  <td className="bad">{store.riskScore}</td>
+                  <td className={store.healthScore > 70 ? "good" : store.healthScore < 40 ? "bad" : ""}>
+                    {store.healthScore}
+                  </td>
+                  <td>{store.wo}</td>
+                  <td>{formatEuro(store.spend)}</td>
+                  <td>{formatEuro(store.avgInvoice)}</td>
+                  <td>{store.emergency}</td>
+                  <td>{store.overNTE}</td>
+                  <td>{store.providers}</td>
                 </tr>
               ))}
             </tbody>
