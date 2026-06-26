@@ -14,7 +14,8 @@
     "react-dom": "latest",
     "recharts": "latest",
     "lucide-react": "latest",
-    "papaparse": "latest"
+    "papaparse": "latest",
+    "xlsx": "latest"
   },
   "devDependencies": {}
 }
